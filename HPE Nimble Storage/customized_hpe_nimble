@@ -1,0 +1,742 @@
+      # STELLAR_INIT_BEGIN
+      # 2024/04/23
+      # Modified: false
+      require 'resolv'
+
+      MAX_NESTED_HASH_DEPTH = 10
+
+      MAX_KEY_LENGTH = 64
+
+      MAC_ADDRESS_REGEX = /^(?:(([0-9A-Fa-f]{2}-){5}[0-9A-Fa-f]{2})|(([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})|([0-9a-fA-F]{4}\.[0-9a-fA-F]{4}\.[0-9a-fA-F]{4})|([0-9A-Fa-f]{12}))$/
+
+
+      DEF_ORG_ID = "default-organization"
+      AOS_CONF_FILE = "/etc/aella/aos.yaml"
+      AOS_FIELD_NAME_RUNNING_SAAS = 'is_running_saas'
+      AOS_FIELD_NAME_ORG_ID = 'org_id'
+      STELLAR_CONFIG = '/etc/td-agent/plugin/config/log_forwarder_config.json'
+      FEATURE_NAME_RAW_LOG_CAPTURE = "raw_log_capture"
+      def initialize()
+        @is_running_saas = stellar_config_is_running_saas()
+        @is_raw_log_capture = stellar_config_is_raw_log_capture_enabled()
+        regex_rfc3164 = /^<(?<syslog_priority>\d{1,3})>(?<syslog_timestamp>[A-Z][a-z]+\s+\d{1,2}\s[0-2][0-9]:[0-5][0-9]:[0-5][0-9])\s(?<syslog_hostname>[!-~]{1,255}|-)\s(?<syslog_appname>[^\[:]+)(?:\[(?<syslog_procid>[!-~]{1,128})\])?:?\s*(?<syslog_message>.+?)\s*$/
+
+        @main_regex = Regexp.union(regex_rfc3164)
+
+        @parser_rule_set = JSON.parse(
+          '{
+            "version": "5.2.0",
+            "vendor": "hpe_nimble",
+            "msg_origin_source": "hpe_nimble",
+            "msg_class": "hpe_nimble",
+            "msg_origin_category": "storage",
+            "store_raw_msg": false,
+            "debug_mode": false,
+            "ignore_values": [],
+            "top_fields": {
+            },
+            "vendor_fields": {
+              "Group": {},
+              "Type": {},
+              "Id": {},
+              "Object_Id": {},
+              "Object": {},
+              "Access_Type": {},
+              "Client_IP": {},
+              "Status": {},
+              "Version": {},
+              "Message": {},
+              "Array": {},
+              "Target": {},
+              "*": {}
+            },
+            "ns_fields": {
+              "syslog_priority": {
+                "data_type": "integer",
+                "normalized_name": "log.syslog.priority"
+              },
+              "syslog_timestamp": {
+                "data_type": "date",
+                "normalized_name": "log.syslog.timestamp"
+              },
+              "syslog_hostname": {
+                "normalized_name": "log.syslog.hostname"
+              },
+              "syslog_appname": {
+                "normalized_name": "log.syslog.appname"
+              },
+              "syslog_procid": {
+                "normalized_name": "log.syslog.procid"
+              },
+              "syslog_message": {
+                "normalized_name": "log.event_description"
+              },
+              "Time": {
+                "data_type": "date",
+                "normalized_name": "event.timestamp"
+              }
+            }
+          }')
+        @debug_mode = (@parser_rule_set["debug_mode"] == true)
+        @vendor = @parser_rule_set['vendor']
+        @regex_message = generate_message_regex()
+      end
+      # STELLAR_INIT_END
+
+      # STELLAR_PARSE_BEGIN
+      def parse(text)
+        if text.nil? || text.empty?
+          yield nil, nil
+          return
+        end
+
+        begin
+          time, record, success = preprocess_and_tokenize(text, @parser_rule_set)
+          return unless success
+
+          time, record, success = normalization(text, record, @parser_rule_set)
+          return unless success
+
+          enrichment(text, record, @parser_rule_set)
+
+          if @debug_mode
+            log.info "time = #{time}, record=#{record}"
+          end
+        rescue => e
+          time, record = general_error_record(text, @parser_rule_set['msg_origin_source'], '', e)
+        ensure
+          yield time, record
+        end
+      end
+
+      def preprocess_and_tokenize(text, parser_rule_set)
+        record = {}
+        match_data = @main_regex.match(text.strip)
+        unless match_data
+          time, record = general_error_record(text, parser_rule_set['msg_origin_source'], 'Unsupported format')
+          return [time, record, false]
+        end
+        match_data.names.each { |key|
+          record[key] = match_data[key].strip unless match_data[key].nil?
+        }
+
+        if record['syslog_message']
+          parse_syslog_message(record)
+        end
+        [nil, record, true]
+      end
+
+      def normalization(text, record, parser_rule_set)
+        success = true
+        time, record = normalize_record(record, parser_rule_set)
+        if record['parser_err_msg']
+          success = false
+          time, record = general_error_record(text, parser_rule_set['msg_origin_source'], record['parser_err_msg'])
+        end
+        [time, record, success]
+      end
+
+      def enrichment(text, record, parser_rule_set)
+        enrich_record(text, record, parser_rule_set)
+      end
+
+      def generate_message_regex()
+        regex_message_group = /^\s*Group:(?<Group>.*?)\sType:(?<Type>.*?)\sTime:(?<Time>.*?)\sId:(?<Id>.*?)\sObject Id:(?<Object_Id>.*?)\sObject:(?<Object>.*?)\sAccess Type:(?<Access_Type>.*?)\sClient IP:(?<Client_IP>.*?)\sStatus:(?<Status>.*?)\sVersion:(?<Version>.*?)\sMessage:(?<Message>.*?)$/
+        regex_message_array = /^\s*Array:(?<Array>.*?)\sType:(?<Type>.*?)\sTime:(?<Time>.*?)\sId:(?<Id>.*?)\sTarget:(?<Target>.*?)\sVersion:(?<Version>.*?)\sMessage:(?<Message>.*?)$/
+
+        regex_message = Regexp.union(regex_message_group, regex_message_array)
+
+        regex_message
+      end
+
+      def parse_syslog_message(record)
+        msg = record['syslog_message']
+        return if msg.nil? || msg.empty?
+
+        matched = msg.match(@regex_message)
+        unless matched.nil?
+          record.delete('syslog_message')
+          matched.names.each{|group_name|
+            record[group_name] = matched[group_name] unless matched[group_name].nil?
+          }
+        end
+        return
+      end
+
+      def normalize_record(old_record, parser_rule_set)
+          vendor = parser_rule_set["vendor"]
+          delay_delete = []
+          record = {}
+          fields_type = [ "top_fields", "ns_fields", "vendor_fields" ]
+
+          normalized_field_type = nil
+          default_normalized_name = nil
+
+          record['msg_data'] = old_record.delete('msg_data') if old_record['msg_data'] && old_record['msg_data'].is_a?(Array) && !old_record['msg_data'].empty?
+          record['msg_origin'] = old_record.delete('msg_origin') if old_record['msg_origin']
+
+          fields_type.each do |type|
+              next if parser_rule_set[type].nil?
+              parser_rule_set[type].each do |field, attr|
+                  if field == "*"
+                      normalized_field_type = type
+                      if attr['normalized_name']
+                          case type
+                          when "top_fields"
+                              default_normalized_name = attr['normalized_name'] unless attr['normalized_name'].include?(".")
+                          when "ns_fields"
+                              default_normalized_name = attr['normalized_name']
+                          when "vendor_fields"
+                              default_normalized_name = attr['normalized_name']
+                          end
+                      end
+                      next
+                  end
+                  key, value, origin_value = normalize_kv(old_record, field, attr, type)
+                  # Remove invalid key/value
+                  if key.nil? or key.empty? or parser_rule_set["ignore_values"].include?(value)
+                      delay_delete.push(field)
+                      next
+                  end
+                  if type == "top_fields"
+                      if key.is_a?(Array)
+                          key.each do |real_key|
+                              if get_value_from_record(record, real_key, 1) == nil
+                                  record[real_key] = value
+                              else
+                                  msg_data_insert(record, field, origin_value)
+                              end
+                          end
+                      else
+                          if get_value_from_record(record, key, 1) == nil
+                              if key == "vendor.#{field}"
+                                  record[vendor] = {} if record[vendor].nil?
+                                  add_kv_to_record(record[vendor], field, origin_value, 1)
+                              else
+                                  record[key] = value
+                              end
+                          else
+                              msg_data_insert(record, field, origin_value)
+                          end
+                      end
+                  elsif type == "vendor_fields"
+                      record[vendor] = {} if record[vendor].nil?
+                      if get_value_from_record(record[vendor], key, 1) == nil
+                          add_kv_to_record(record[vendor], key, value, 1)
+                      else
+                          msg_data_insert(record, field, origin_value)
+                      end
+                  else
+                      if key.is_a?(Array)
+                          key.each do |real_key|
+                              if get_value_from_record(record, real_key, 1) == nil
+                                  add_kv_to_record(record, real_key, value, 1)
+                              else
+                                  msg_data_insert(record, field, origin_value)
+                              end
+                          end
+                      else
+                          if get_value_from_record(record, key, 1) == nil
+                              if key == "vendor.#{field}"
+                                  record[vendor] = {} if record[vendor].nil?
+                                  add_kv_to_record(record[vendor], field, origin_value, 1)
+                              else
+                                  add_kv_to_record(record, key, value, 1)
+                              end
+                          else
+                              msg_data_insert(record, field, origin_value)
+                          end
+                      end
+                  end
+                  delay_delete.push(field)
+              end
+          end
+
+          if not (parser_rule_set["keep_field_after_normalize"] == true)
+              delay_delete.each do |field|
+                  remove_field_from_record_and_its_empty_parents(old_record, field, 1)
+              end
+          end
+          # If vendor_fields contains "*", put all fields that have not
+          # normalized into vendor namespace.
+          if is_running_saas()
+              if normalized_field_type.nil?
+                  old_record.each{|key, value|
+                      msg_data_insert(record, key, value)
+                  }
+              else
+                  msg_data_record = nil
+                  if normalized_field_type == 'top_fields'
+                      if default_normalized_name.nil?
+                          msg_data_record = simple_deep_merge_without_overwrite(old_record, record, parser_rule_set["ignore_values"])
+                      else
+                          if record[default_normalized_name].nil?
+                              record[default_normalized_name] = old_record
+                          else
+                              old_record.each{|key, value|
+                                  msg_data_insert(record, key, value)
+                              }
+                          end
+                      end
+                  elsif normalized_field_type == 'ns_fields'
+                      if default_normalized_name.nil? || get_value_from_record(record, default_normalized_name, 1) != nil
+                          old_record.each{|key, value|
+                              msg_data_insert(record, key, value)
+                          }
+                      else
+                          add_kv_to_record(record, default_normalized_name, old_record, 1)
+                      end
+                  elsif normalized_field_type == 'vendor_fields'
+                      record[vendor] = {} if record[vendor].nil?
+                      if default_normalized_name.nil?
+                          msg_data_record = simple_deep_merge_without_overwrite(old_record, record[vendor], parser_rule_set["ignore_values"])
+                      else
+                          if get_value_from_record(record[vendor], default_normalized_name, 1) == nil
+                              add_kv_to_record(record[vendor], default_normalized_name, old_record, 1)
+                          else
+                              old_record.each{|key, value|
+                                  msg_data_insert(record, key, value)
+                              }
+                          end
+                      end
+                  end
+                  unless msg_data_record.nil?
+                      msg_data_record.each{ |key, value|
+                          msg_data_insert(record, key, value)
+                      }
+                  end
+              end
+          else
+              if parser_rule_set["vendor_fields"] and parser_rule_set["vendor_fields"]["*"]
+                  record[vendor] = {} if record[vendor].nil?
+                  msg_data_record = simple_deep_merge_without_overwrite(old_record, record[vendor], parser_rule_set["ignore_values"])
+                  msg_data_record.each{ |key, value|
+                      msg_data_insert(record, key, value)
+                  }
+              else
+                  msg_data_record = simple_deep_merge_without_overwrite(old_record, record, parser_rule_set["ignore_values"])
+                  msg_data_record.each{ |key, value|
+                      msg_data_insert(record, key, value)
+                  }
+              end
+          end
+
+          record.delete(vendor) if record[vendor] && record[vendor].empty?
+
+          time = get_event_time_from_record(record)
+
+          return time, record
+      end
+
+      def enrich_record(text, record, parser_rule_set)
+          create_timestamp(record)
+
+          add_config_info(record, parser_rule_set)
+
+          set_log_index(record)
+
+          store_raw_msg(record, text, parser_rule_set)
+      end
+
+      def general_error_record(text, msg_origin_source, *parameter)
+          record = {}
+          time = Time.now
+          record['timestamp'] = (time.to_f * 1000).to_i
+          record['msg_origin'] ||= {}
+          record['msg_origin']['source'] = msg_origin_source
+          record['msg_class'] = "#{msg_origin_source}_err_msg"
+          # TODO: Remove dev_type and dev_class
+          record['dev_type'] = record['msg_origin']['source']
+          record['dev_class'] = record['msg_class']
+          case parameter.length
+          when 1
+              record['parser_raw_msg'] = text
+              record['parser_err_msg'] = parameter[0]
+          when 2
+              record.merge!(parse_exception(text, parameter[1]))
+          when 3
+              record.merge!(parse_exception(text, parameter[1], parameter[2]))
+          end
+          return time.to_i, record
+      end
+
+      def add_config_info(record, parser_rule_set)
+          record['msg_origin'] ||= {}
+          record['msg_origin']['category'] = parser_rule_set['msg_origin_category']
+          record['msg_origin']['source'] =
+              if parser_rule_set['msg_origin_source']
+                  parser_rule_set['msg_origin_source']
+              else
+                  parser_rule_set['dev_type']
+              end
+          record['msg_class'] =
+              if parser_rule_set['msg_class']
+                  parser_rule_set['msg_class']
+              else
+                  parser_rule_set['dev_class']
+              end
+          if record['ips'] && record['ips'].is_a?(Hash)
+              record['msg_class'] = 'ips'
+          end
+          # TODO: Remove dev_type and dev_class
+          record['dev_type'] = record['msg_origin']['source']
+          record['dev_class'] = record['msg_class']
+      end
+
+      def add_kv_to_record(record, key, value, depth)
+          if depth > MAX_NESTED_HASH_DEPTH
+              record["parser_err_msg"] = "depth #{depth} exceeds limit #{MAX_NESTED_HASH_DEPTH}"
+              return record
+          end
+
+          begin
+              if key.include?('.')
+                  new_key = key.split('.', 2)
+                  if record[new_key[0]].nil?
+                      record[new_key[0]] = {}
+                  end
+                  add_kv_to_record(record[new_key[0]], new_key[1], value, depth+1)
+              else
+                  record[key] = value
+              end
+          rescue
+              record["parser_err_msg"] = "fail in depth #{depth}"
+          end
+          return record
+      end
+
+      def create_timestamp(record)
+          if record["event"] && record["event"]["timestamp"]
+              time = record["event"]["timestamp"]
+          elsif record["log"] && record["log"]["syslog"] && record["log"]["syslog"]["timestamp"]
+              time = record["log"]["syslog"]["timestamp"]
+          else
+              time = (Time.now.to_f*1000).to_i
+          end
+          record['timestamp'] = time
+      end
+
+      def date2epoch_ms(str,time_format=nil)
+          begin
+              if time_format.nil?
+                  time = Time.parse(str)
+              else
+                  time_parser = Fluent::TimeParser.new(time_format)
+                  time = time_parser.parse(str)
+              end
+              timeint = ((time.to_f)*1000).round.to_i
+          rescue => exception
+              timeint = 0
+          end
+          return timeint
+      end
+
+      def get_event_time_from_record(record)
+          if record["event"] and record["event"]["timestamp"]
+              time = (record["event"]["timestamp"].to_f / 1000).to_i
+          elsif record["log"] and record["log"]["syslog"] and record["log"]["syslog"]["timestamp"]
+              time = (record["log"]["syslog"]["timestamp"].to_f / 1000).to_i
+          else
+              time = Time.now.to_i
+          end
+          return time
+      end
+
+      def get_value_from_record(record, key, depth)
+          if depth > MAX_NESTED_HASH_DEPTH
+              return nil
+          end
+
+          begin
+              if key.include?('.')
+                  new_key = key.split('.', 2)
+                  if record[new_key[0]].nil?
+                      return nil
+                  end
+                  return get_value_from_record(record[new_key[0]], new_key[1], depth+1)
+              else
+                  return record[key]
+              end
+          rescue
+              return nil
+          end
+
+          return nil
+      end
+
+      def is_running_saas()
+          return is_saas()
+      end
+
+      def is_saas()
+          return @is_running_saas
+      end
+
+      #Follow logic of aella_os ds_common.is_running_saas
+      #FIXME if we can confirm org_id is not a factor
+      def stellar_config_is_running_saas()
+        begin
+          running_saas = false
+          if File.file?(AOS_CONF_FILE)
+            val = get_device_config(AOS_FIELD_NAME_RUNNING_SAAS).chomp
+            if val == "1"
+              running_saas = true
+            else
+              val = get_device_config(AOS_FIELD_NAME_ORG_ID).chomp
+              if (not val.empty?) and val != DEF_ORG_ID
+                running_saas = true
+              end
+            end
+
+            $log.info "running_saas #{running_saas}"
+          else
+            $log.error "#{AOS_CONF_FILE} does not exist"
+          end
+        rescue Exception => e
+          $log.error "Error in is_running_saas #{e}"
+        end
+
+        return running_saas
+      end
+
+      #FIXME:in the future we should use yaml lib function
+      def get_device_config(key)
+        return output = `grep '\\- #{key} = ' #{AOS_CONF_FILE} | awk '{print $4}'`
+      end
+
+      def is_valid_ip_addr(ip_addr)
+          ip_addr_regex = Regexp.union(Resolv::IPv4::Regex, Resolv::IPv6::Regex)
+          if ip_addr_regex =~ ip_addr
+              return true
+          else
+              return false
+          end
+      end
+
+      def is_valid_mac_address(mac_str)
+          return nil unless mac_str.is_a?(String)
+          mac_str =~ MAC_ADDRESS_REGEX
+      end
+
+      def msg_data_insert(record, name, value)
+
+          if record["msg_data"].nil?
+              record["msg_data"] = [{"name" => name, "strvalue" => value.to_s}]
+          else
+              record["msg_data"].push({"name" => name, "strvalue" => value.to_s})
+          end
+      end
+
+      def normalize_kv(record, field, attr, type)
+          # No normalization is needed if there is no such field
+          return "", "", "" if field.nil? or attr.nil?
+          orig_value = get_value_from_record(record, field, 1)
+          return "", "", "" if orig_value.nil?
+
+          begin
+              # Normalized name can be a array or a string
+              if attr["normalized_name"]
+                  key = attr["normalized_name"]
+                  key.strip! if key.is_a?(String)
+              else
+                  key = field.strip
+              end
+
+              case attr["data_type"]
+              when "integer"
+                  value = orig_value.to_i
+              when "date"
+                  time_str = orig_value
+                  # Append timezone as needed before translate into epoch
+                  if attr["timezone"] and record[attr["timezone"]]
+                      # TODO Define regexp in json
+                      timezone = record[attr["timezone"]].scan(/[+-]\d{4}/) # Extract +0900 from KST(+0900)
+                      time_str = orig_value + ' ' + timezone[0] if timezone
+                  end
+                  value = date2epoch_ms(time_str,attr["time_format"])
+                  if value == 0
+                      if key.is_a?(String)
+                          if key.end_with?("timestamp")
+                              key = key[0..-6] + "_str"
+                          else
+                              key = key + "_str"
+                          end
+                      end
+                      value = orig_value
+                  end
+              when "object"
+                  value = orig_value
+              when 'ip'
+                  if is_valid_ip_addr(orig_value)
+                      value = orig_value
+                  else
+                      case type
+                      when "top_fields"
+                          key = "vendor.#{field}"
+                      when "vendor_fields"
+                          key = field
+                      else
+                          key = "vendor.#{field}"
+                      end
+                  end
+              when 'mac'
+                  mac_address = to_mac_address(orig_value)
+                  if mac_address
+                      value = mac_address
+                  else
+                      case type
+                      when "top_fields"
+                          key = "vendor.#{field}"
+                      when "vendor_fields"
+                          key = field
+                      else
+                          key = "vendor.#{field}"
+                      end
+                  end
+              else # string
+                  value = orig_value.to_s
+              end
+
+              if key.is_a?(String) and (key == "event.timezone")
+                  # TODO define regexp in json
+                  timezone = value.scan(/[+-]\d{4}/) # Extract +0900 from KST(+0900)
+                  value = timezone[0] if timezone
+              end
+          rescue
+              if record["parser_raw_msg"].nil?
+                  record["parser_raw_msg"] = record.to_s
+                  record["parser_err_msg"] = "abort in normalizing key/value pair #{key}/#{value}"
+              end
+              return "", "", ""
+          end
+
+          return key, value, orig_value
+      end
+
+      def parse_exception(text, e, info="parse error")
+          stack_trace_arr = e.backtrace_locations[0].to_s.split(/[\\\/]/)
+          return {"parser_raw_msg" => text, "parser_err_msg" => info + ": error_class=>[#{e.class}] error=>[#{e.message}] error_pos=>[#{stack_trace_arr[-1]}]"}
+      end
+
+      def remove_field_from_record_and_its_empty_parents(record, key, depth)
+          if depth > MAX_NESTED_HASH_DEPTH
+              return nil
+          end
+
+          begin
+              if key.include?('.')
+                  new_key = key.split('.', 2)
+                  if record[new_key[0]].nil?
+                      return nil
+                  end
+                  to_be_returned = remove_field_from_record_and_its_empty_parents(record[new_key[0]], new_key[1], depth+1)
+                  record.delete(new_key[0]) if record[new_key[0]].empty?
+                  return to_be_returned
+              else
+                  return record.delete(key)
+              end
+          rescue
+              return nil
+          end
+
+          return nil
+      end
+
+      def set_log_index(record)
+          record["stellar_log_index"] = 'syslog'
+          ignore_values =  [ "", "n/a", "N/A", "-", "null", "/","None" ]
+          proto_values = [1, 2]
+          proto_name_values = ['icmp', 'igmp']
+          ip_regexp = /(([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4})|((\d{1,3}.){3}\d{1,3})/
+          if record['threat'] and record['threat'] != 'N/A'
+              record["stellar_log_index"] = 'threat'
+          elsif ( (record['proto'] and proto_values.include?(record['proto'])) or \
+              (record['proto_name'] and proto_name_values.include?(record['proto_name'].downcase)) ) \
+              and record['srcip'] and !ignore_values.include?(record['srcip']) \
+              and record['dstip']  and !ignore_values.include?(record['dstip'])
+
+              if record['srcip'].match(ip_regexp) and record['dstip'].match(ip_regexp) and \
+                  record['dstip'] != '0.0.0.0'
+                  record["stellar_log_index"] = 'session'
+              end
+          elsif record['srcip'] and !ignore_values.include?(record['srcip'])  \
+              and record['srcport']  and !ignore_values.include?(record['srcport']) \
+              and record['dstip']  and !ignore_values.include?(record['dstip']) \
+              and record['dstport'] and !ignore_values.include?(record['dstport']) and \
+              (record['proto'] or record['proto_name'])
+
+              #check ip format if it is correct and port range if it is from 0 to 65535
+              if record['srcip'].match(ip_regexp) and record['dstip'].match(ip_regexp) and\
+                  record['dstport'] >= 0 and record['dstport']  <= 65535 and \
+                  record['srcport'] >= 0 and record['srcport']  <= 65535 and \
+                  record['dstip'] != '0.0.0.0'
+
+                  record["stellar_log_index"] = 'session'
+              end
+          end
+          return record
+      end
+
+      def simple_deep_merge_without_overwrite(src, dst, ignore_values)
+          msg_data_list = {}
+          src.each{|key,value|
+              next if ignore_values && ignore_values.include?(value)
+              if dst.has_key?(key)
+                  if dst[key].is_a?(Hash) && value.is_a?(Hash)
+                      sub_msg_data_list = simple_deep_merge_without_overwrite(value, dst[key], ignore_values)
+                      sub_msg_data_list.each{ |sub_key, sub_value|
+                          msg_data_list["#{key}.#{sub_key}"] = sub_value
+                      }
+                  else
+                      msg_data_list[key] = value
+                  end
+              elsif value.is_a?(Hash)
+                  dst[key] = {}
+                  sub_msg_data_list = simple_deep_merge_without_overwrite(value, dst[key], ignore_values)
+                      sub_msg_data_list.each{ |sub_key, sub_value|
+                          msg_data_list["#{key}.#{sub_key}"] = sub_value
+                      }
+              else
+                  dst[key] = value
+              end
+          }
+          return msg_data_list
+      end
+
+      def store_raw_msg(record, text, parser_rule_set)
+          if parser_rule_set['store_raw_msg'] or @is_raw_log_capture
+              record["parser_raw_msg"] = text
+          end
+      end
+
+      def to_mac_address(mac_str)
+          return nil unless is_valid_mac_address(mac_str)
+          if mac_str.include?(":")
+              mac_str
+          else
+              mac = mac_str.gsub(/\.|-/, '')
+              "#{mac[0,2]}:#{mac[2,2]}:#{mac[4,2]}:#{mac[6,2]}:#{mac[8,2]}:#{mac[10,2]}"
+          end
+      end
+
+      def stellar_config_is_raw_log_capture_enabled()
+        begin
+            raw_log_capture = false
+            if File.file?(STELLAR_CONFIG)
+                log_forwarder_config = JSON.parse(File.read(STELLAR_CONFIG))
+                raw_log_capture = log_forwarder_config[FEATURE_NAME_RAW_LOG_CAPTURE]
+                if raw_log_capture
+                    $log.info "raw log capture is enabled"
+                else
+                    $log.info "raw log capture is disabled"
+                end
+            else
+                $log.warn "Log Forwarder config JSON file does not exist"
+            end
+        rescue
+            $log.warn "Log Forwarder config JSON cannot be loaded"
+        end
+
+        return raw_log_capture
+      end
+      # STELLAR_PARSE_END
