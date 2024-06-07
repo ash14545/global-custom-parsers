@@ -1,5 +1,5 @@
 {
-    "Device Vendor": "HPE Nimble Storage",
+    "device_vendor": "HPE Nimble Storage",
     "model": "Head Shelf AF-214699 , Model AF40",
     "software_version": "5.2.1.1000-1017822-opt"
 }
